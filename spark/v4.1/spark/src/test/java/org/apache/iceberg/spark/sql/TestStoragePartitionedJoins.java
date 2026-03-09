@@ -77,6 +77,7 @@ public class TestStoragePartitionedJoins extends TestBaseWithCatalog {
   }
 
   private static final String OTHER_TABLE_NAME = "other_table";
+  private static final String THIRD_TABLE_NAME = "third_table";
 
   // open file cost and split size are set as 16 MB to produce a split per file
   private static final Map<String, String> TABLE_PROPERTIES =
@@ -131,6 +132,7 @@ public class TestStoragePartitionedJoins extends TestBaseWithCatalog {
   public void removeTables() {
     sql("DROP TABLE IF EXISTS %s", tableName);
     sql("DROP TABLE IF EXISTS %s", tableName(OTHER_TABLE_NAME));
+    sql("DROP TABLE IF EXISTS %s", tableName(THIRD_TABLE_NAME));
   }
 
   // TODO: add tests for truncate transforms once SPARK-40295 is released
@@ -775,6 +777,115 @@ public class TestStoragePartitionedJoins extends TestBaseWithCatalog {
             + "ORDER BY t1.id, t1.int_col, t1.dep, t2.id, t2.int_col, t2.dep",
         tableName,
         otherTableName);
+  }
+
+  @TestTemplate
+  public void testThreeWayJoinWithBucketing() throws NoSuchTableException {
+    String createTableStmt =
+        "CREATE TABLE %s (id BIGINT, int_col INT, dep STRING)"
+            + "USING iceberg "
+            + "PARTITIONED BY (bucket(4, id))"
+            + "TBLPROPERTIES (%s)";
+
+    sql(createTableStmt, tableName, tablePropsAsString(TABLE_PROPERTIES));
+    sql(createTableStmt, tableName(OTHER_TABLE_NAME), tablePropsAsString(TABLE_PROPERTIES));
+    sql(createTableStmt, tableName(THIRD_TABLE_NAME), tablePropsAsString(TABLE_PROPERTIES));
+
+    String insertStmt =
+        "INSERT INTO %s VALUES "
+            + "(1L, 100, 'software'),"
+            + "(2L, 101, 'hr'),"
+            + "(3L, 102, 'operation'),"
+            + "(4L, 103, 'sales'),"
+            + "(5L, 104, 'marketing'),"
+            + "(6L, 105, 'pr')";
+
+    sql(insertStmt, tableName);
+    sql(insertStmt, tableName(OTHER_TABLE_NAME));
+    sql(insertStmt, tableName(THIRD_TABLE_NAME));
+
+    // 3-way left join should work with SPJ
+    assertPartitioningAwarePlan(
+        1, /* expected num of shuffles with SPJ (only the final sort) */
+        4, /* expected num of shuffles without SPJ */
+        "SELECT t1.id, t2.int_col, t3.dep "
+            + "FROM %s t1 "
+            + "LEFT JOIN %s t2 ON t1.id = t2.id "
+            + "LEFT JOIN %s t3 ON t1.id = t3.id "
+            + "ORDER BY t1.id",
+        tableName,
+        tableName(OTHER_TABLE_NAME),
+        tableName(THIRD_TABLE_NAME));
+  }
+
+  @TestTemplate
+  public void testThreeWayJoinWithPartialClustering() throws NoSuchTableException {
+    String createTableStmt =
+        "CREATE TABLE %s (id BIGINT, int_col INT, dep STRING)"
+            + "USING iceberg "
+            + "PARTITIONED BY (bucket(4, id))"
+            + "TBLPROPERTIES (%s)";
+
+    sql(createTableStmt, tableName, tablePropsAsString(TABLE_PROPERTIES));
+    sql(createTableStmt, tableName(OTHER_TABLE_NAME), tablePropsAsString(TABLE_PROPERTIES));
+    sql(createTableStmt, tableName(THIRD_TABLE_NAME), tablePropsAsString(TABLE_PROPERTIES));
+
+    String insertStmt =
+        "INSERT INTO %s VALUES "
+            + "(1L, 100, 'software'),"
+            + "(2L, 101, 'hr'),"
+            + "(3L, 102, 'operation'),"
+            + "(4L, 103, 'sales'),"
+            + "(5L, 104, 'marketing'),"
+            + "(6L, 105, 'pr')";
+
+    sql(insertStmt, tableName);
+
+    // write to second table twice to generate 2 files per partition
+    sql(insertStmt, tableName(OTHER_TABLE_NAME));
+    sql(insertStmt, tableName(OTHER_TABLE_NAME));
+
+    sql(insertStmt, tableName(THIRD_TABLE_NAME));
+
+    // 3-way left join with partially clustered distribution enabled
+    Map<String, String> spjWithPartialClustering =
+        ImmutableMap.<String, String>builder()
+            .put(SQLConf.V2_BUCKETING_ENABLED().key(), "true")
+            .put(SQLConf.V2_BUCKETING_PUSH_PART_VALUES_ENABLED().key(), "true")
+            .put(SQLConf.REQUIRE_ALL_CLUSTER_KEYS_FOR_CO_PARTITION().key(), "false")
+            .put(SQLConf.ADAPTIVE_EXECUTION_ENABLED().key(), "false")
+            .put(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD().key(), "-1")
+            .put(SparkSQLProperties.PRESERVE_DATA_GROUPING, "true")
+            .put(SQLConf.V2_BUCKETING_PARTIALLY_CLUSTERED_DISTRIBUTION_ENABLED().key(), "true")
+            .put(SQLConf.V2_BUCKETING_ALLOW_JOIN_KEYS_SUBSET_OF_PARTITION_KEYS().key(), "true")
+            .put(SQLConf.V2_BUCKETING_ALLOW_COMPATIBLE_TRANSFORMS().key(), "true")
+            .buildOrThrow();
+
+    AtomicReference<List<Object[]>> rowsWithSPJ = new AtomicReference<>();
+    AtomicReference<List<Object[]>> rowsWithoutSPJ = new AtomicReference<>();
+
+    String query =
+        "SELECT t1.id, t2.int_col, t3.dep "
+            + "FROM %s t1 "
+            + "LEFT JOIN %s t2 ON t1.id = t2.id "
+            + "LEFT JOIN %s t3 ON t1.id = t3.id "
+            + "ORDER BY t1.id";
+
+    withSQLConf(
+        spjWithPartialClustering,
+        () -> {
+          rowsWithSPJ.set(
+              sql(query, tableName, tableName(OTHER_TABLE_NAME), tableName(THIRD_TABLE_NAME)));
+        });
+
+    withSQLConf(
+        DISABLED_SPJ_SQL_CONF,
+        () -> {
+          rowsWithoutSPJ.set(
+              sql(query, tableName, tableName(OTHER_TABLE_NAME), tableName(THIRD_TABLE_NAME)));
+        });
+
+    assertEquals("SPJ should not change query output", rowsWithoutSPJ.get(), rowsWithSPJ.get());
   }
 
   private void checkJoin(String sourceColumnName, String sourceColumnType, String transform)
